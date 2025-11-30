@@ -122,16 +122,16 @@
 @Scheduled(cron = "0 0 2 * * ?")  // 매일 새벽 2시
 public void verifyBalances() {
     List<Account> accounts = accountRepository.findAll();
-    
+
     for (Account account : accounts) {
         BigDecimal accountBalance = account.getBalance();
         BigDecimal ledgerBalance = ledgerRepository
-            .calculateBalance(account.getAccountNumber());
-        
+                .calculateBalance(account.getAccountNumber());
+
         if (!accountBalance.equals(ledgerBalance)) {
             // 불일치 감지! 알림 발송
             alertService.sendBalanceMismatchAlert(
-                account, accountBalance, ledgerBalance);
+                    account, accountBalance, ledgerBalance);
         }
     }
 }
@@ -413,49 +413,94 @@ Content-Type: application/json
 ## 📂 패키지 구조
 
 ```
-com.junbank.ledger
+com.jun_bank.ledger_service
 ├── LedgerServiceApplication.java
-├── domain
-│   ├── entity
-│   │   ├── LedgerEntry.java
-│   │   └── AuditLog.java
-│   ├── enums
-│   │   ├── EntryType.java
-│   │   └── TransactionCategory.java
-│   └── repository
-│       ├── LedgerEntryRepository.java
-│       └── AuditLogRepository.java
-├── application
-│   ├── service
-│   │   ├── LedgerService.java
-│   │   ├── AuditLogService.java
-│   │   └── BalanceVerificationService.java
-│   ├── dto
-│   │   ├── request
-│   │   │   └── VerifyBalanceRequest.java
-│   │   └── response
-│   │       ├── LedgerEntryResponse.java
-│   │       ├── BalanceSummaryResponse.java
-│   │       └── VerificationResultResponse.java
-│   └── scheduler
-│       └── BalanceVerificationScheduler.java
-├── infrastructure
-│   ├── kafka
-│   │   └── LedgerEventConsumer.java  (주로 수신만)
-│   ├── feign
-│   │   └── AccountServiceClient.java
-│   ├── protection
-│   │   ├── AppendOnlyInterceptor.java
-│   │   └── ImmutableEntity.java
-│   └── config
-│       ├── JpaConfig.java
-│       └── KafkaConfig.java
-└── presentation
-    ├── controller
-    │   └── LedgerController.java
-    └── advice
-        └── LedgerExceptionHandler.java
+├── global/                          # 전역 설정 레이어
+│   ├── config/                      # 설정 클래스
+│   │   ├── JpaConfig.java           # JPA Auditing 활성화
+│   │   ├── QueryDslConfig.java      # QueryDSL JPAQueryFactory 빈
+│   │   ├── KafkaProducerConfig.java # Kafka Producer (멱등성, JacksonJsonSerializer)
+│   │   ├── KafkaConsumerConfig.java # Kafka Consumer (수동 ACK, JacksonJsonDeserializer)
+│   │   ├── SecurityConfig.java      # Spring Security (헤더 기반 인증)
+│   │   ├── FeignConfig.java         # Feign Client 설정
+│   │   ├── SwaggerConfig.java       # OpenAPI 문서화
+│   │   └── AsyncConfig.java         # 비동기 처리 (ThreadPoolTaskExecutor)
+│   ├── infrastructure/
+│   │   ├── entity/
+│   │   │   └── BaseEntity.java      # 공통 엔티티 (Audit, Soft Delete)
+│   │   └── jpa/
+│   │       └── AuditorAwareImpl.java # JPA Auditing 사용자 정보
+│   ├── security/
+│   │   ├── UserPrincipal.java       # 인증 사용자 Principal
+│   │   ├── HeaderAuthenticationFilter.java # Gateway 헤더 인증 필터
+│   │   └── SecurityContextUtil.java # SecurityContext 유틸리티
+│   ├── feign/
+│   │   ├── FeignErrorDecoder.java   # Feign 에러 → BusinessException 변환
+│   │   └── FeignRequestInterceptor.java # 인증 헤더 전파
+│   └── aop/
+│       └── LoggingAspect.java       # 요청/응답 로깅 AOP
+└── domain/
+    └── ledger/                      # Ledger 도메인
+        ├── domain/                  # 순수 도메인 (Entity, VO, Enum)
+        ├── application/             # 유스케이스, Port, DTO
+        │   └── scheduler/           # 잔액 검증 스케줄러
+        │       └── BalanceVerificationScheduler.java
+        ├── infrastructure/          # Adapter (Out) - Repository, Kafka
+        │   └── protection/          # 불변성 보호 (추후 구현)
+        │       ├── AppendOnlyInterceptor.java
+        │       └── ImmutableEntity.java
+        └── presentation/            # Adapter (In) - Controller
 ```
+
+---
+
+## 🔧 Global 레이어 상세
+
+### Config 설정
+
+| 클래스 | 설명 |
+|--------|------|
+| `JpaConfig` | JPA Auditing 활성화 (`@EnableJpaAuditing`) |
+| `QueryDslConfig` | `JPAQueryFactory` 빈 등록 |
+| `KafkaProducerConfig` | 멱등성 Producer (ENABLE_IDEMPOTENCE=true, ACKS=all) |
+| `KafkaConsumerConfig` | 수동 ACK (MANUAL_IMMEDIATE), group-id: ledger-service-group |
+| `SecurityConfig` | Stateless 세션, 헤더 기반 인증, CSRF 비활성화 |
+| `FeignConfig` | 로깅 레벨 BASIC, 에러 디코더, 요청 인터셉터 |
+| `SwaggerConfig` | OpenAPI 3.0 문서화 설정 |
+| `AsyncConfig` | ThreadPoolTaskExecutor (core=5, max=10, queue=25) |
+
+### Security 설정
+
+| 클래스 | 설명 |
+|--------|------|
+| `HeaderAuthenticationFilter` | `X-User-Id`, `X-User-Role`, `X-User-Email` 헤더 → SecurityContext |
+| `UserPrincipal` | `UserDetails` 구현체, 인증된 사용자 정보 |
+| `SecurityContextUtil` | 현재 사용자 조회 유틸리티 |
+
+### BaseEntity (Soft Delete 지원)
+
+```java
+@MappedSuperclass
+public abstract class BaseEntity {
+    private LocalDateTime createdAt;      // 생성일시 (자동)
+    private LocalDateTime updatedAt;      // 수정일시 (자동)
+    private String createdBy;             // 생성자 (자동)
+    private String updatedBy;             // 수정자 (자동)
+    private LocalDateTime deletedAt;      // 삭제일시
+    private String deletedBy;             // 삭제자
+    private Boolean isDeleted = false;    // 삭제 여부
+    
+    public void delete(String deletedBy);  // Soft Delete
+    public void restore();                 // 복구
+}
+```
+
+### 추후 구현 예정 (불변성 보호)
+
+| 클래스 | 설명 |
+|--------|------|
+| `AppendOnlyInterceptor` | UPDATE/DELETE 차단 인터셉터 |
+| `ImmutableEntity` | 불변 엔티티 마커 인터페이스 |
 
 ---
 
@@ -493,23 +538,23 @@ com.junbank.ledger
 ```java
 @Component
 public class AppendOnlyInterceptor implements PreUpdateEventListener, PreDeleteEventListener {
-    
+
     @Override
     public boolean onPreUpdate(PreUpdateEvent event) {
         if (event.getEntity() instanceof ImmutableEntity) {
             throw new IllegalStateException(
-                "UPDATE not allowed on immutable entity: " + 
-                event.getEntity().getClass().getSimpleName());
+                    "UPDATE not allowed on immutable entity: " +
+                            event.getEntity().getClass().getSimpleName());
         }
         return false;
     }
-    
+
     @Override
     public boolean onPreDelete(PreDeleteEvent event) {
         if (event.getEntity() instanceof ImmutableEntity) {
             throw new IllegalStateException(
-                "DELETE not allowed on immutable entity: " + 
-                event.getEntity().getClass().getSimpleName());
+                    "DELETE not allowed on immutable entity: " +
+                            event.getEntity().getClass().getSimpleName());
         }
         return false;
     }
@@ -539,15 +584,15 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER no_update_ledger
-BEFORE UPDATE ON ledger_entries
-FOR EACH ROW
-EXECUTE FUNCTION prevent_update();
+    BEFORE UPDATE ON ledger_entries
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_update();
 
 -- DELETE 방지 트리거
 CREATE TRIGGER no_delete_ledger
-BEFORE DELETE ON ledger_entries
-FOR EACH ROW
-EXECUTE FUNCTION prevent_delete();
+    BEFORE DELETE ON ledger_entries
+    FOR EACH ROW
+    EXECUTE FUNCTION prevent_delete();
 ```
 
 ---
@@ -560,7 +605,7 @@ EXECUTE FUNCTION prevent_delete();
 void 원장_기록_수정_시도시_예외_발생() {
     // Given: 원장 기록 생성
     LedgerEntry entry = ledgerRepository.save(createEntry());
-    
+
     // When & Then: 수정 시도 시 예외 발생
     entry.setAmount(BigDecimal.ZERO);  // 수정 시도
     assertThrows(IllegalStateException.class, () -> {
@@ -572,7 +617,7 @@ void 원장_기록_수정_시도시_예외_발생() {
 void 원장_기록_삭제_시도시_예외_발생() {
     // Given: 원장 기록 생성
     LedgerEntry entry = ledgerRepository.save(createEntry());
-    
+
     // When & Then: 삭제 시도 시 예외 발생
     assertThrows(IllegalStateException.class, () -> {
         ledgerRepository.delete(entry);
@@ -585,10 +630,10 @@ void 원장_기록_삭제_시도시_예외_발생() {
 @Test
 void 잔액_불일치_감지() {
     // Given: Account와 Ledger 잔액이 다른 상태
-    
+
     // When: 잔액 검증 실행
     VerificationResult result = balanceVerificationService.verify(accountNumber);
-    
+
     // Then:
     assertFalse(result.isMatch());
     verify(alertService).sendBalanceMismatchAlert(any());
