@@ -4,7 +4,7 @@ plugins {
     id 'io.spring.dependency-management' version '1.1.7'
 }
 
-group = 'com.junbank'
+group = 'com.jun_bank'
 version = '0.0.1-SNAPSHOT'
 description = 'Ledger Service - 원장 기록 서비스 (Append-only, 이벤트 소싱 학습)'
 
