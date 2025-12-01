@@ -93,8 +93,8 @@
 │                                                             │
 │   ┌─────────────────────────────────────────────────────┐   │
 │   │ entry │ account │ debit   │ credit  │ description  │   │
-│   │   1   │    A    │ 50,000  │    0    │ 이체 출금    │   │
-│   │   1   │    B    │    0    │ 50,000  │ 이체 입금    │   │
+│   │   1   │    A    │    0    │ 50,000  │ 이체 출금    │   │
+│   │   1   │    B    │ 50,000  │    0    │ 이체 입금    │   │
 │   └─────────────────────────────────────────────────────┘   │
 │                                                             │
 │   검증: 차변 합계 (50,000) = 대변 합계 (50,000) ✓           │
@@ -122,16 +122,16 @@
 @Scheduled(cron = "0 0 2 * * ?")  // 매일 새벽 2시
 public void verifyBalances() {
     List<Account> accounts = accountRepository.findAll();
-
+    
     for (Account account : accounts) {
         BigDecimal accountBalance = account.getBalance();
         BigDecimal ledgerBalance = ledgerRepository
-                .calculateBalance(account.getAccountNumber());
-
+            .calculateBalance(account.getAccountNumber());
+        
         if (!accountBalance.equals(ledgerBalance)) {
             // 불일치 감지! 알림 발송
             alertService.sendBalanceMismatchAlert(
-                    account, accountBalance, ledgerBalance);
+                account, accountBalance, ledgerBalance);
         }
     }
 }
@@ -141,73 +141,142 @@ public void verifyBalances() {
 
 ## 🗄️ 도메인 모델
 
-### LedgerEntry Entity (원장 기록)
-
+### 도메인 구조
 ```
-┌─────────────────────────────────────────────┐
-│               LedgerEntry                    │
-├─────────────────────────────────────────────┤
-│ id: Long (PK, Auto)                         │
-│ entryId: String (UUID, Unique)              │
-│ transactionId: String (원본 거래 ID)         │
-│ accountNumber: String                       │
-│ entryType: EntryType (DEBIT/CREDIT)         │
-│ amount: BigDecimal                          │
-│ balanceAfter: BigDecimal (거래 후 잔액)      │
-│ description: String                         │
-│ category: TransactionCategory               │
-│ referenceType: String (원본 서비스)          │
-│ referenceId: String (원본 ID)               │
-│ createdAt: LocalDateTime (불변)             │
-│                                             │
-│ ⚠️ 이 테이블은 INSERT만 허용!               │
-│ ⚠️ UPDATE/DELETE 금지!                      │
-└─────────────────────────────────────────────┘
+domain/ledger/domain/
+├── exception/
+│   ├── LedgerErrorCode.java        # 에러 코드 정의
+│   └── LedgerException.java        # 도메인 예외
+└── model/
+    ├── LedgerEntry.java            # 원장 엔트리 (Immutable)
+    ├── AuditLog.java               # 감사 로그 (Immutable)
+    ├── EntryType.java              # DEBIT/CREDIT
+    ├── TransactionCategory.java    # 거래 카테고리
+    └── vo/
+        ├── LedgerEntryId.java      # LDG-xxxxxxxx
+        ├── AuditLogId.java         # AUD-xxxxxxxx
+        └── Money.java              # 금액 VO
 ```
 
-### AuditLog Entity (감사 로그)
-
+### LedgerEntry 도메인 모델 (Immutable)
 ```
-┌─────────────────────────────────────────────┐
-│                AuditLog                      │
-├─────────────────────────────────────────────┤
-│ id: Long (PK, Auto)                         │
-│ eventId: String (UUID)                      │
-│ eventType: String                           │
-│ serviceName: String (발생 서비스)            │
-│ userId: Long                                │
-│ resourceType: String (ex: "Account")        │
-│ resourceId: String                          │
-│ action: String (ex: "BALANCE_CHANGED")      │
-│ previousValue: String (JSON)                │
-│ newValue: String (JSON)                     │
-│ ipAddress: String                           │
-│ userAgent: String                           │
-│ timestamp: LocalDateTime                    │
-│                                             │
-│ ⚠️ 이 테이블도 INSERT만 허용!               │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                      LedgerEntry                             │
+│                    ⚠️ INSERT만 허용!                          │
+├─────────────────────────────────────────────────────────────┤
+│ 【핵심 필드 - 모두 불변】                                      │
+│ entryId: LedgerEntryId (PK, LDG-xxxxxxxx)                   │
+│ transactionId: String (복식부기 그룹화용)                   │
+│ accountNumber: String                                       │
+│ entryType: EntryType (DEBIT/CREDIT)                        │
+│ amount: Money (거래 금액)                                   │
+│ balanceAfter: Money (거래 후 잔액)                          │
+│ description: String (거래 설명)                             │
+│ category: TransactionCategory                               │
+│ referenceType: String (원본 서비스)                         │
+│ referenceId: String (원본 ID)                               │
+│ createdAt: LocalDateTime (불변)                             │
+├─────────────────────────────────────────────────────────────┤
+│ 【읽기 전용 메서드】                                          │
+│ + isNew(), isDebit(), isCredit()                            │
+│ + increasesBalance(), decreasesBalance()                    │
+│                                                             │
+│ 【비즈니스 메서드 없음 - Immutable】                         │
+│ 수정 필요시 새 엔트리 추가 (취소 처리 등)                    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### EntryType Enum
+### EntryType Enum (복식부기)
 ```java
 public enum EntryType {
-    DEBIT,   // 차변 (자산 증가, 부채 감소)
-    CREDIT   // 대변 (자산 감소, 부채 증가)
+    DEBIT("차변", increasesBalance=true),   // 자산 증가 (입금)
+    CREDIT("대변", increasesBalance=false); // 자산 감소 (출금)
+    
+    public boolean increasesBalance();      // 잔액 증가 여부
+    public boolean decreasesBalance();      // 잔액 감소 여부
+    public boolean isDebit();
+    public boolean isCredit();
+    public EntryType opposite();            // DEBIT ↔ CREDIT
 }
 ```
 
 ### TransactionCategory Enum
 ```java
 public enum TransactionCategory {
-    DEPOSIT,       // 입금
-    WITHDRAWAL,    // 출금
-    TRANSFER_IN,   // 이체 입금
-    TRANSFER_OUT,  // 이체 출금
-    PAYMENT,       // 결제
-    REFUND,        // 환불
-    FEE,           // 수수료
-    INTEREST       // 이자
+    DEPOSIT("입금", DEBIT),
+    WITHDRAWAL("출금", CREDIT),
+    TRANSFER_IN("이체입금", DEBIT),
+    TRANSFER_OUT("이체출금", CREDIT),
+    PAYMENT("결제", CREDIT),
+    REFUND("환불", DEBIT),
+    FEE("수수료", CREDIT),
+    INTEREST("이자", DEBIT);
+    
+    public EntryType getDefaultEntryType();
+    public boolean isIncreasing();
+    public boolean isDecreasing();
+    public boolean isTransfer();
+    public boolean isPaymentRelated();
+    public boolean isSystemGenerated();     // FEE, INTEREST
+}
+```
+
+### AuditLog 도메인 모델 (Immutable)
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       AuditLog                               │
+│                    ⚠️ INSERT만 허용!                          │
+├─────────────────────────────────────────────────────────────┤
+│ 【핵심 필드 - 모두 불변】                                      │
+│ auditLogId: AuditLogId (PK, AUD-xxxxxxxx)                   │
+│ eventType: String (LOGIN_SUCCESS, BALANCE_CHANGED 등)       │
+│ serviceName: String (발생 서비스)                            │
+│ userId: String                                              │
+│ resourceType: String (예: "Account", "Card")                │
+│ resourceId: String                                          │
+│ action: String (CREATE/UPDATE/DELETE)                       │
+│ previousValue: String (JSON)                                │
+│ newValue: String (JSON)                                     │
+│ ipAddress: String                                           │
+│ userAgent: String                                           │
+│ metadata: String (JSON)                                     │
+│ timestamp: LocalDateTime (불변)                             │
+├─────────────────────────────────────────────────────────────┤
+│ 【읽기 전용 메서드】                                          │
+│ + isNew(), isLoginEvent(), isDataChangeEvent()              │
+│ + hasValueChange()                                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Exception 체계
+
+#### LedgerErrorCode
+```java
+public enum LedgerErrorCode implements ErrorCode {
+    // 유효성 (400)
+    INVALID_ENTRY_ID_FORMAT, INVALID_AUDIT_LOG_ID_FORMAT,
+    INVALID_AMOUNT, REQUIRED_FIELD_MISSING, INVALID_ACCOUNT_NUMBER,
+    
+    // 조회 (404)
+    ENTRY_NOT_FOUND, AUDIT_LOG_NOT_FOUND,
+    
+    // 불변성 위반 (403)
+    IMMUTABLE_ENTRY_UPDATE, IMMUTABLE_ENTRY_DELETE,
+    IMMUTABLE_AUDIT_LOG_UPDATE, IMMUTABLE_AUDIT_LOG_DELETE,
+    
+    // 정합성 (500)
+    BALANCE_MISMATCH, DOUBLE_ENTRY_IMBALANCE, DUPLICATE_TRANSACTION;
+}
+```
+
+#### LedgerException (팩토리 메서드)
+```java
+public class LedgerException extends BusinessException {
+    public static LedgerException entryNotFound(String entryId);
+    public static LedgerException immutableEntryUpdate(String entryId);
+    public static LedgerException balanceMismatch(String accountNumber, BigDecimal accountBalance, BigDecimal ledgerBalance);
+    public static LedgerException doubleEntryImbalance(String transactionId, BigDecimal debitTotal, BigDecimal creditTotal);
+    // ...
 }
 ```
 
@@ -218,7 +287,7 @@ public enum TransactionCategory {
 ### 1. 원장 기록 조회 (계좌별)
 ```http
 GET /api/v1/ledger/entries?accountNumber=110-1234-5678-90&page=0&size=20
-X-User-Id: 1
+X-User-Id: USR-a1b2c3d4
 X-User-Role: USER
 ```
 
@@ -228,9 +297,9 @@ X-User-Role: USER
   "accountNumber": "110-1234-5678-90",
   "entries": [
     {
-      "entryId": "entry-uuid-1",
-      "transactionId": "txn-uuid-abcd",
-      "entryType": "CREDIT",
+      "entryId": "LDG-uuid-1",
+      "transactionId": "TXN-uuid-abcd",
+      "entryType": "DEBIT",
       "amount": 100000,
       "balanceAfter": 250000,
       "description": "급여 입금",
@@ -238,9 +307,9 @@ X-User-Role: USER
       "createdAt": "2024-01-15T10:30:00"
     },
     {
-      "entryId": "entry-uuid-2",
-      "transactionId": "txn-uuid-efgh",
-      "entryType": "DEBIT",
+      "entryId": "LDG-uuid-2",
+      "transactionId": "TXN-uuid-efgh",
+      "entryType": "CREDIT",
       "amount": 50000,
       "balanceAfter": 200000,
       "description": "ATM 출금",
@@ -250,16 +319,14 @@ X-User-Role: USER
   ],
   "page": 0,
   "size": 20,
-  "totalElements": 150
+  "totalElements": 100
 }
 ```
-
----
 
 ### 2. 특정 시점 잔액 조회
 ```http
 GET /api/v1/ledger/balance?accountNumber=110-1234-5678-90&asOf=2024-01-15T00:00:00
-X-User-Id: 1
+X-User-Id: USR-a1b2c3d4
 X-User-Role: USER
 ```
 
@@ -267,94 +334,16 @@ X-User-Role: USER
 ```json
 {
   "accountNumber": "110-1234-5678-90",
-  "asOf": "2024-01-15T00:00:00",
   "balance": 150000,
-  "calculatedFrom": "ledger_entries"
+  "asOf": "2024-01-15T00:00:00",
+  "entryCount": 45
 }
 ```
 
----
-
-### 3. 기간별 거래 요약
+### 3. 감사 로그 조회
 ```http
-GET /api/v1/ledger/summary?accountNumber=110-1234-5678-90&startDate=2024-01-01&endDate=2024-01-31
-X-User-Id: 1
-X-User-Role: USER
-```
-
-**Response (200 OK)**
-```json
-{
-  "accountNumber": "110-1234-5678-90",
-  "period": {
-    "start": "2024-01-01",
-    "end": "2024-01-31"
-  },
-  "openingBalance": 100000,
-  "closingBalance": 250000,
-  "summary": {
-    "totalDebit": 80000,
-    "totalCredit": 230000,
-    "netChange": 150000
-  },
-  "byCategory": {
-    "DEPOSIT": 200000,
-    "WITHDRAWAL": -50000,
-    "TRANSFER_IN": 30000,
-    "TRANSFER_OUT": -10000,
-    "PAYMENT": -20000
-  },
-  "transactionCount": 25
-}
-```
-
----
-
-### 4. 잔액 검증 (관리자)
-```http
-POST /api/v1/ledger/verify
-X-User-Id: 999
-X-User-Role: ADMIN
-Content-Type: application/json
-
-{
-  "accountNumbers": ["110-1234-5678-90", "110-9876-5432-10"]
-}
-```
-
-**Response (200 OK)**
-```json
-{
-  "verifiedAt": "2024-01-15T02:00:00",
-  "results": [
-    {
-      "accountNumber": "110-1234-5678-90",
-      "accountBalance": 250000,
-      "ledgerBalance": 250000,
-      "match": true
-    },
-    {
-      "accountNumber": "110-9876-5432-10",
-      "accountBalance": 500000,
-      "ledgerBalance": 499000,
-      "match": false,
-      "difference": 1000,
-      "alertSent": true
-    }
-  ],
-  "totalVerified": 2,
-  "mismatches": 1
-}
-```
-
-**이벤트 발행**: `ledger.balance.mismatch` (불일치 시)
-
----
-
-### 5. 감사 로그 조회 (관리자)
-```http
-GET /api/v1/ledger/audit-logs?resourceType=Account&resourceId=1&page=0&size=20
-X-User-Id: 999
+GET /api/v1/ledger/audit-logs?userId=USR-a1b2c3d4&page=0&size=20
+X-User-Id: admin-user
 X-User-Role: ADMIN
 ```
 
@@ -363,48 +352,30 @@ X-User-Role: ADMIN
 {
   "logs": [
     {
-      "eventId": "audit-uuid-1",
+      "auditLogId": "AUD-uuid-1",
+      "eventType": "LOGIN_SUCCESS",
+      "serviceName": "auth-server",
+      "userId": "USR-a1b2c3d4",
+      "action": "LOGIN",
+      "ipAddress": "192.168.1.100",
+      "timestamp": "2024-01-15T09:00:00"
+    },
+    {
+      "auditLogId": "AUD-uuid-2",
       "eventType": "BALANCE_CHANGED",
       "serviceName": "account-service",
-      "userId": 1,
+      "userId": "USR-a1b2c3d4",
       "resourceType": "Account",
-      "resourceId": "1",
-      "action": "DEPOSIT",
-      "previousValue": {"balance": 150000},
-      "newValue": {"balance": 250000},
-      "ipAddress": "192.168.1.1",
+      "resourceId": "ACC-12345678",
+      "action": "UPDATE",
+      "previousValue": "{\"balance\": 100000}",
+      "newValue": "{\"balance\": 150000}",
       "timestamp": "2024-01-15T10:30:00"
     }
   ],
   "page": 0,
   "size": 20,
-  "totalElements": 500
-}
-```
-
----
-
-### 6. 계좌 명세서 생성
-```http
-POST /api/v1/ledger/statements
-X-User-Id: 1
-X-User-Role: USER
-Content-Type: application/json
-
-{
-  "accountNumber": "110-1234-5678-90",
-  "startDate": "2024-01-01",
-  "endDate": "2024-01-31",
-  "format": "PDF"
-}
-```
-
-**Response (202 Accepted)**
-```json
-{
-  "statementId": "stmt-uuid-1234",
-  "status": "GENERATING",
-  "message": "명세서 생성 중입니다. 완료 시 알림을 드립니다."
+  "totalElements": 200
 }
 ```
 
@@ -415,41 +386,65 @@ Content-Type: application/json
 ```
 com.jun_bank.ledger_service
 ├── LedgerServiceApplication.java
-├── global/                          # 전역 설정 레이어
-│   ├── config/                      # 설정 클래스
-│   │   ├── JpaConfig.java           # JPA Auditing 활성화
-│   │   ├── QueryDslConfig.java      # QueryDSL JPAQueryFactory 빈
-│   │   ├── KafkaProducerConfig.java # Kafka Producer (멱등성, JacksonJsonSerializer)
-│   │   ├── KafkaConsumerConfig.java # Kafka Consumer (수동 ACK, JacksonJsonDeserializer)
-│   │   ├── SecurityConfig.java      # Spring Security (헤더 기반 인증)
-│   │   ├── FeignConfig.java         # Feign Client 설정
-│   │   ├── SwaggerConfig.java       # OpenAPI 문서화
-│   │   └── AsyncConfig.java         # 비동기 처리 (ThreadPoolTaskExecutor)
+├── global/                              # 전역 설정 레이어
+│   ├── config/                          # 설정 클래스
+│   │   ├── JpaConfig.java               # JPA Auditing 활성화
+│   │   ├── QueryDslConfig.java          # QueryDSL JPAQueryFactory 빈
+│   │   ├── KafkaProducerConfig.java     # Kafka Producer (멱등성, JacksonJsonSerializer)
+│   │   ├── KafkaConsumerConfig.java     # Kafka Consumer (수동 ACK, JacksonJsonDeserializer)
+│   │   ├── SecurityConfig.java          # Spring Security (헤더 기반 인증)
+│   │   ├── FeignConfig.java             # Feign Client 설정
+│   │   ├── SwaggerConfig.java           # OpenAPI 문서화
+│   │   └── AsyncConfig.java             # 비동기 처리 (ThreadPoolTaskExecutor)
 │   ├── infrastructure/
 │   │   ├── entity/
-│   │   │   └── BaseEntity.java      # 공통 엔티티 (Audit, Soft Delete)
+│   │   │   └── BaseEntity.java          # 공통 엔티티 (Audit, Soft Delete)
 │   │   └── jpa/
-│   │       └── AuditorAwareImpl.java # JPA Auditing 사용자 정보
+│   │       └── AuditorAwareImpl.java    # JPA Auditing 사용자 정보
 │   ├── security/
-│   │   ├── UserPrincipal.java       # 인증 사용자 Principal
+│   │   ├── UserPrincipal.java           # 인증 사용자 Principal
 │   │   ├── HeaderAuthenticationFilter.java # Gateway 헤더 인증 필터
-│   │   └── SecurityContextUtil.java # SecurityContext 유틸리티
+│   │   └── SecurityContextUtil.java     # SecurityContext 유틸리티
 │   ├── feign/
-│   │   ├── FeignErrorDecoder.java   # Feign 에러 → BusinessException 변환
+│   │   ├── FeignErrorDecoder.java       # Feign 에러 → BusinessException 변환
 │   │   └── FeignRequestInterceptor.java # 인증 헤더 전파
 │   └── aop/
-│       └── LoggingAspect.java       # 요청/응답 로깅 AOP
+│       └── LoggingAspect.java           # 요청/응답 로깅 AOP
 └── domain/
-    └── ledger/                      # Ledger 도메인
-        ├── domain/                  # 순수 도메인 (Entity, VO, Enum)
-        ├── application/             # 유스케이스, Port, DTO
-        │   └── scheduler/           # 잔액 검증 스케줄러
+    └── ledger/                          # Ledger Bounded Context
+        ├── domain/                      # 순수 도메인 ★ 구현 완료
+        │   ├── exception/
+        │   │   ├── LedgerErrorCode.java
+        │   │   └── LedgerException.java
+        │   └── model/
+        │       ├── LedgerEntry.java         # Immutable
+        │       ├── AuditLog.java            # Immutable
+        │       ├── EntryType.java
+        │       ├── TransactionCategory.java
+        │       └── vo/
+        │           ├── LedgerEntryId.java
+        │           ├── AuditLogId.java
+        │           └── Money.java
+        ├── application/                 # 유스케이스 (TODO)
+        │   ├── port/
+        │   │   ├── in/
+        │   │   └── out/
+        │   ├── service/
+        │   ├── dto/
+        │   └── scheduler/               # 잔액 검증 스케줄러
         │       └── BalanceVerificationScheduler.java
-        ├── infrastructure/          # Adapter (Out) - Repository, Kafka
-        │   └── protection/          # 불변성 보호 (추후 구현)
+        ├── infrastructure/              # Adapter Out (TODO)
+        │   ├── persistence/
+        │   │   ├── entity/              # JPA Entity
+        │   │   ├── repository/
+        │   │   └── adapter/
+        │   ├── kafka/
+        │   └── protection/              # 불변성 보호 (추후 구현)
         │       ├── AppendOnlyInterceptor.java
         │       └── ImmutableEntity.java
-        └── presentation/            # Adapter (In) - Controller
+        └── presentation/                # Adapter In (TODO)
+            ├── controller/
+            └── dto/
 ```
 
 ---
@@ -538,23 +533,23 @@ public abstract class BaseEntity {
 ```java
 @Component
 public class AppendOnlyInterceptor implements PreUpdateEventListener, PreDeleteEventListener {
-
+    
     @Override
     public boolean onPreUpdate(PreUpdateEvent event) {
         if (event.getEntity() instanceof ImmutableEntity) {
             throw new IllegalStateException(
-                    "UPDATE not allowed on immutable entity: " +
-                            event.getEntity().getClass().getSimpleName());
+                "UPDATE not allowed on immutable entity: " + 
+                event.getEntity().getClass().getSimpleName());
         }
         return false;
     }
-
+    
     @Override
     public boolean onPreDelete(PreDeleteEvent event) {
         if (event.getEntity() instanceof ImmutableEntity) {
             throw new IllegalStateException(
-                    "DELETE not allowed on immutable entity: " +
-                            event.getEntity().getClass().getSimpleName());
+                "DELETE not allowed on immutable entity: " + 
+                event.getEntity().getClass().getSimpleName());
         }
         return false;
     }
@@ -584,15 +579,15 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER no_update_ledger
-    BEFORE UPDATE ON ledger_entries
-    FOR EACH ROW
-    EXECUTE FUNCTION prevent_update();
+BEFORE UPDATE ON ledger_entries
+FOR EACH ROW
+EXECUTE FUNCTION prevent_update();
 
 -- DELETE 방지 트리거
 CREATE TRIGGER no_delete_ledger
-    BEFORE DELETE ON ledger_entries
-    FOR EACH ROW
-    EXECUTE FUNCTION prevent_delete();
+BEFORE DELETE ON ledger_entries
+FOR EACH ROW
+EXECUTE FUNCTION prevent_delete();
 ```
 
 ---
@@ -605,7 +600,7 @@ CREATE TRIGGER no_delete_ledger
 void 원장_기록_수정_시도시_예외_발생() {
     // Given: 원장 기록 생성
     LedgerEntry entry = ledgerRepository.save(createEntry());
-
+    
     // When & Then: 수정 시도 시 예외 발생
     entry.setAmount(BigDecimal.ZERO);  // 수정 시도
     assertThrows(IllegalStateException.class, () -> {
@@ -617,7 +612,7 @@ void 원장_기록_수정_시도시_예외_발생() {
 void 원장_기록_삭제_시도시_예외_발생() {
     // Given: 원장 기록 생성
     LedgerEntry entry = ledgerRepository.save(createEntry());
-
+    
     // When & Then: 삭제 시도 시 예외 발생
     assertThrows(IllegalStateException.class, () -> {
         ledgerRepository.delete(entry);
@@ -630,10 +625,10 @@ void 원장_기록_삭제_시도시_예외_발생() {
 @Test
 void 잔액_불일치_감지() {
     // Given: Account와 Ledger 잔액이 다른 상태
-
+    
     // When: 잔액 검증 실행
     VerificationResult result = balanceVerificationService.verify(accountNumber);
-
+    
     // Then:
     assertFalse(result.isMatch());
     verify(alertService).sendBalanceMismatchAlert(any());
@@ -644,12 +639,12 @@ void 잔액_불일치_감지() {
 ```bash
 # 원장 기록 조회
 curl "http://localhost:8080/api/v1/ledger/entries?accountNumber=110-1234-5678-90" \
-  -H "X-User-Id: 1" \
+  -H "X-User-Id: USR-xxx" \
   -H "X-User-Role: USER"
 
 # 특정 시점 잔액 조회
 curl "http://localhost:8080/api/v1/ledger/balance?accountNumber=110-1234-5678-90&asOf=2024-01-15T00:00:00" \
-  -H "X-User-Id: 1" \
+  -H "X-User-Id: USR-xxx" \
   -H "X-User-Role: USER"
 ```
 
@@ -657,19 +652,44 @@ curl "http://localhost:8080/api/v1/ledger/balance?accountNumber=110-1234-5678-90
 
 ## 📝 구현 체크리스트
 
-- [ ] Entity, Repository 생성
-- [ ] **ImmutableEntity 마커 인터페이스**
-- [ ] **AppendOnlyInterceptor 구현**
-- [ ] LedgerService 구현
-- [ ] AuditLogService 구현
-- [ ] **BalanceVerificationService 구현**
-- [ ] **BalanceVerificationScheduler 구현**
-- [ ] Controller 구현
-- [ ] **Kafka Consumer 구현 (다양한 이벤트 수신)**
-- [ ] Feign Client 구현 (Account Service)
-- [ ] **DB 트리거 스크립트 작성**
-- [ ] Append-only 테스트 코드
-- [ ] 잔액 검증 테스트 코드
-- [ ] 단위 테스트
-- [ ] 통합 테스트
-- [ ] API 문서화 (Swagger)
+### Domain Layer ✅
+- [x] LedgerErrorCode
+- [x] LedgerException
+- [x] EntryType (복식부기)
+- [x] TransactionCategory
+- [x] LedgerEntryId VO
+- [x] AuditLogId VO
+- [x] Money VO
+- [x] LedgerEntry (Immutable)
+- [x] AuditLog (Immutable)
+
+### Application Layer
+- [ ] LedgerEntryUseCase
+- [ ] AuditLogUseCase
+- [ ] BalanceVerificationService
+- [ ] LedgerPort
+- [ ] AuditLogPort
+- [ ] DTO 정의
+- [ ] BalanceVerificationScheduler
+
+### Infrastructure Layer
+- [ ] LedgerEntryEntity
+- [ ] AuditLogEntity
+- [ ] JpaRepository
+- [ ] ImmutableEntity 마커 인터페이스
+- [ ] AppendOnlyInterceptor (UPDATE/DELETE 차단)
+- [ ] LedgerKafkaConsumer
+- [ ] AccountServiceClient (Feign)
+- [ ] DB 트리거 스크립트
+
+### Presentation Layer
+- [ ] LedgerController
+- [ ] AuditLogController
+- [ ] Request/Response DTO
+- [ ] Swagger 문서화
+
+### 테스트
+- [ ] 도메인 단위 테스트
+- [ ] Append-only 보호 테스트
+- [ ] 잔액 검증 테스트
+- [ ] 복식부기 검증 테스트
